@@ -1,8 +1,8 @@
-# CaseHub Workers — Camel Worker Design (Revised v3)
+# CaseHub Workers — Camel Worker Design (Revised v4)
 
 **Date:** 2026-06-08
 **Status:** Approved — pending implementation plan
-**Revision:** v3 — second review cycle; NC1–NC5 + ND1–ND6 + NM1–NM2 addressed
+**Revision:** v4 — third review cycle; NC1–NC4 + ND1–ND5 + NM1–NM2 addressed
 
 ---
 
@@ -22,8 +22,6 @@ This spec covers:
 
 ## 2. Engine Integration
 
-Two distinct engine call sites. The spec must satisfy both correctly.
-
 ### 2.1 ReactiveWorkerProvisioner — capability probe
 
 Called from `CaseContextChangedEventHandler.tryProvision()` when no pre-defined case-definition worker matches a required capability:
@@ -31,7 +29,7 @@ Called from `CaseContextChangedEventHandler.tryProvision()` when no pre-defined 
 1. Engine calls `getCapabilities()` — checks provisioner's supported set.
 2. If the needed capability is present, calls `provision(caps, provisionContext)`.
 3. After provision returns, fires `CaseLifecycleEvent("WorkerStarted")` — notification only.
-4. Does **not** fire `WorkflowExecutionCompleted` here. No work dispatched yet.
+4. Does **not** fire `WorkflowExecutionCompleted`. No work dispatched yet.
 
 For Camel: `provision()` validates the route exists and returns `ProvisionResult.empty()`. Routes are always-running; nothing to spin up.
 
@@ -41,20 +39,40 @@ Called from `WorkerScheduleEventHandler` for every work dispatch:
 
 1. Computes `inputDataHash = WorkerExecutionKeys.inputDataHash(caseId, workerName, capabilityName, inputData)` — the idempotency key matching `caseInstance.getWaitingForWorkId()`.
 2. Calls `workerExecutionManager.submit(eventLogId, instance, worker, capability, inputData)`.
-3. The execution manager fires `WorkflowExecutionCompleted` on `WORKER_EXECUTION_FINISHED` when done, or `WorkflowExecutionFailed` on `WORKFLOW_EXECUTION_FAILED` on fault.
-4. `WorkflowExecutionCompletedHandler` and `PlanItemCompletionHandler` both consume `WORKER_EXECUTION_FINISHED` (see Section 4.2 — must use `publish()`, not `request()`).
+3. On success: execution manager fires `WorkflowExecutionCompleted` on `WORKER_EXECUTION_FINISHED`.
+4. On fault: execution manager fires on `CamelWorkerEventBusAddresses.CAMEL_WORKER_FAULT` (NOT `WORKFLOW_EXECUTION_FAILED` — see Section 2.4).
+5. `WorkflowExecutionCompletedHandler` and `PlanItemCompletionHandler` both consume `WORKER_EXECUTION_FINISHED` via `eventBus.publish()`.
 
-### 2.3 CDI resolution
+### 2.3 CDI resolution and co-deployment constraint
 
-`NoOpReactiveWorkerProvisioner` and `NoOpWorkerExecutionManager` are `@DefaultBean @ApplicationScoped`. Camel implementations must be plain `@ApplicationScoped` (no `@DefaultBean`) — CDI displaces defaults by classpath presence. Identical pattern to claudony.
+`NoOpReactiveWorkerProvisioner` and `NoOpWorkerExecutionManager` are `@DefaultBean @ApplicationScoped`. `CamelReactiveWorkerProvisioner` and `CamelWorkerExecutionManager` are plain `@ApplicationScoped` (no `@DefaultBean`) — CDI displaces the no-op defaults when Camel beans are present.
 
-### 2.4 Module dependencies
+**Co-deployment constraint:** `QuartzWorkerExecutionManager` is also `@ApplicationScoped` (not `@DefaultBean`). If `scheduler-quartz` and `workers-camel` are both on the classpath, CDI has two non-default `WorkerExecutionManager` beans and fails with an ambiguous dependency at startup. `workers-camel` is not designed for co-deployment with `scheduler-quartz`. Applications requiring both must implement a composite `WorkerExecutionManager` that routes by worker type — this is a separate concern tracked in a follow-on engine issue (see Section 8).
+
+### 2.4 Fault event bus address isolation
+
+`QuartzWorkerExecutionJobListener` handles `WORKFLOW_EXECUTION_FAILED` with no worker-type filter — it processes all events on that address. If Camel fires on `WORKFLOW_EXECUTION_FAILED`, two things happen: (1) Quartz schedules a Quartz job for a Camel worker (wrong execution type), and (2) the failure count is incremented twice (one write per handler), causing the retry comparison to be off by one.
+
+**The fix: Camel faults use a separate event bus address**, defined in `workers-camel`:
+
+```java
+// workers-camel
+public final class CamelWorkerEventBusAddresses {
+    public static final String CAMEL_WORKER_FAULT = "casehub.workers.camel.fault";
+}
+```
+
+`CamelWorkerFaultPublisher` fires on `CAMEL_WORKER_FAULT`. `CamelWorkerFaultEventHandler` handles `CAMEL_WORKER_FAULT`. `QuartzWorkerExecutionJobListener` never sees Camel faults; `CamelWorkerFaultEventHandler` never sees Quartz faults.
+
+`WorkflowCompletionPublisher` in `workers-common` has no `fail()` method. Fault publication is worker-type-specific and lives in `workers-camel`.
+
+### 2.5 Module dependencies
 
 `workers-common` depends on:
-- `casehub-engine-api` — `ReactiveWorkerProvisioner`, `ReactiveWorkerStatusListener`, `ProvisionResult`, `ProvisionContext`, `WorkResult`, `Worker`, `Capability`
-- `casehub-engine-common` — `WorkerExecutionManager`, `WorkflowExecutionCompleted`, `WorkflowExecutionFailed`, `CaseInstance`, `EventBusAddresses`, `WorkerExecutionKeys`
+- `casehub-engine-api` — `ReactiveWorkerProvisioner`, `ReactiveWorkerStatusListener`, `ProvisionResult`, `ProvisionContext`, `WorkResult`, `Worker`, `Capability`, `ExecutionPolicy`, `RetryPolicy`, `BackoffStrategy`
+- `casehub-engine-common` — `WorkerExecutionManager`, `WorkflowExecutionCompleted`, `CaseInstance`, `EventBusAddresses`, `WorkerExecutionKeys`, `EventLogRepository`
 
-Same pattern as claudony. `casehub-engine-common` is an internal module explicitly consumed by integration-tier repos.
+Same dependency pattern as claudony.
 
 ---
 
@@ -68,35 +86,33 @@ casehub-workers/
   workers-testing/
 ```
 
-`workers-common` must be first in the parent POM `<modules>` list — all other modules depend on it.
-
 ---
 
 ## 4. `workers-common`
 
 ### 4.1 Core types
 
-**`WorkerCorrelationContext`** — carries data needed to fire `WorkflowExecutionCompleted` at async completion time:
+**`WorkerCorrelationContext`**:
 
 ```java
 record WorkerCorrelationContext(
-    CaseInstance caseInstance,   // needed for WorkflowExecutionCompleted; see mutable-state note
-    Worker worker,               // needed for WorkflowExecutionCompleted
+    CaseInstance caseInstance,   // mutable — see note below
+    Worker worker,
     String idempotency,          // WorkerExecutionKeys.inputDataHash — matches waitingForWorkId
     String tenancyId
 ) {}
 ```
 
-**Mutable CaseInstance note:** `CaseInstance` is mutable — the engine calls `setState()` and `setWaitingForWorkId()` on it during normal operation. The registry holds this reference for up to `casehub.workers.async.timeout-minutes` (default: 60 minutes). If the case completes, cancels, or changes state while the Camel route is in flight, `resumeIfWaiting()` inside `WorkflowExecutionCompletedHandler` checks `caseInstance.getState() == WAITING` before resuming — it will silently no-op if the case is already in a terminal state. The stale-reference risk is acknowledged as a known constraint consistent with claudony; it is more significant at 60-minute TTLs. Future mitigation: load a fresh `CaseInstance` from `CrossTenantCaseInstanceRepository` at completion time instead of storing the reference — deferred to when the multi-node registry ships.
+**Mutable CaseInstance note:** `CaseInstance` is mutable — the engine calls `setState()` and `setWaitingForWorkId()` during normal operation. The registry holds this reference for up to `casehub.workers.async.timeout-minutes` (default: 60 minutes). `resumeIfWaiting()` inside `WorkflowExecutionCompletedHandler` checks `caseInstance.getState() == WAITING` before resuming — it no-ops if the case is already terminal. Stale-reference risk is a known constraint shared with claudony; more significant at 60-minute TTLs. Mitigation (deferred): load a fresh `CaseInstance` from `CrossTenantCaseInstanceRepository` at completion time.
 
-**`PendingCompletion`** — one entry per registered async dispatch. The registry generates `dispatchId`:
+**`PendingCompletion`** — registry generates `dispatchId` and `callbackToken`:
 
 ```java
 record PendingCompletion(
     String dispatchId,              // UUID generated by registry — registry key AND casehub-worker-id header value
     WorkerCorrelationContext correlationContext,
     String callbackToken,           // UUID for REST callback auth; generated by registry
-    Capability capability,          // needed to construct WorkflowExecutionFailed on timeout/fault
+    Capability capability,          // needed to construct fault events on timeout
     Long eventLogId,                // needed for WORKER_EXECUTION_FAILED event log entry
     Instant registeredAt,
     Instant expiresAt,
@@ -104,27 +120,25 @@ record PendingCompletion(
 ) {}
 ```
 
-`dispatchId` is the stable key for all lookup operations — it is unique per dispatch and avoids the collision that would occur if `worker.getName()` were used as the key (two concurrent dispatches of the same capability for different cases would collide).
+`dispatchId` is the stable per-dispatch unique key — prevents the collision that `worker.getName()` would cause when two concurrent dispatches of the same capability for different cases are registered simultaneously.
 
-**`CompletionExpiredEvent`** — CDI event fired when a pending completion TTL expires. Workers-camel observes this to initiate the fault path without `workers-common` needing to know about the engine event bus:
+**`CompletionExpiredEvent`** — CDI event fired by `AsyncWorkerCompletionRegistry.expireStale()`:
 
 ```java
 record CompletionExpiredEvent(PendingCompletion pending) {}
 ```
 
-**`WorkerCompletionPayload`** — JSON body for `POST /workers/complete/{dispatchId}`:
+**`WorkerCompletionPayload`** — REST callback body:
 
 ```java
 record WorkerCompletionPayload(
-    Map<String, Object> output,   // result data; empty map acceptable
-    boolean faulted,              // true = faulted; false = completed
-    String errorMessage           // nullable; informational when faulted=true
+    Map<String, Object> output,
+    boolean faulted,
+    String errorMessage   // nullable; informational when faulted=true
 ) {}
 ```
 
-`errorMessage` is informational only — it is not written to the case context. It enables external systems to include a failure reason for observability.
-
-**`CasehubWorkerHeaders`** — header/key name constants shared across all worker types:
+**`CasehubWorkerHeaders`**:
 
 ```java
 public final class CasehubWorkerHeaders {
@@ -138,114 +152,74 @@ public final class CasehubWorkerHeaders {
 }
 ```
 
-`casehub-worker-id` carries the `dispatchId` UUID — not `worker.getName()`. External systems that need to call back use this header value as the `{dispatchId}` path parameter in `POST /workers/complete/{dispatchId}`.
-
-**`WorkerProvisioningException`**:
-
-```java
-public class WorkerProvisioningException extends RuntimeException {
-    private final String capability;
-    public static WorkerProvisioningException noRouteFound(String capability) { ... }
-    public static WorkerProvisioningException startupFailed(String capability, Throwable cause) { ... }
-}
-```
-
-**`WorkerCapabilityResolver<T>`** — plain interface (not `@FunctionalInterface`). Implementations must follow the three-tier chain: SPI → Config → Convention. `@FunctionalInterface` was incorrect — the resolver is a multi-step class, not a lambda:
-
-```java
-public interface WorkerCapabilityResolver<T> {
-    /**
-     * Resolve the dispatch target for a capability tag.
-     * Implementations MUST attempt resolution: SPI (highest) → Config → Convention (lowest).
-     * Throws WorkerProvisioningException if no mapping found.
-     */
-    T resolve(String capabilityTag);
-    Set<String> capabilities();   // union of all three tiers, computed at startup
-    Optional<String> firstMatch(Set<String> candidates); // first capability in candidates that this resolver knows
-}
-```
+**`WorkerProvisioningException`**, **`WorkerCapabilityResolver<T>`** (plain interface, not `@FunctionalInterface`): unchanged from v3.
 
 ### 4.2 Services
 
-**`WorkflowCompletionPublisher`** — fires on `WORKER_EXECUTION_FINISHED` event bus using `publish()` (not `request()`). `WORKER_EXECUTION_FINISHED` has two consumers — `WorkflowExecutionCompletedHandler` and `PlanItemCompletionHandler` — and `publish()` delivers to all. Using `request()` would deliver to exactly one consumer (point-to-point), causing `PlanItemCompletionHandler` to miss completions in blackboard-enabled deployments. This is the same bug documented in the engine's session diary (2026-04-22: `CaseStartedEventHandler` used `request()` and caused rotating consumer delivery):
+**`WorkflowCompletionPublisher`** — fires `WORKER_EXECUTION_FINISHED` using `eventBus.publish()`. No `fail()` method — fault publication is worker-type-specific:
 
 ```java
 @ApplicationScoped
 public class WorkflowCompletionPublisher {
     @Inject EventBus eventBus;
 
+    /** Fires to all consumers of WORKER_EXECUTION_FINISHED (publish, not request). */
     public void complete(WorkerCorrelationContext ctx, Map<String, Object> output) {
         eventBus.publish(EventBusAddresses.WORKER_EXECUTION_FINISHED,
             WorkflowExecutionCompleted.approved(
                 ctx.caseInstance(), ctx.worker(), ctx.idempotency(), output));
     }
-
-    public void fail(PendingCompletion pending, Throwable cause) {
-        eventBus.publish(EventBusAddresses.WORKFLOW_EXECUTION_FAILED,
-            new WorkflowExecutionFailed(
-                pending.correlationContext().caseInstance(),
-                pending.correlationContext().worker(),
-                pending.capability(),
-                pending.correlationContext().idempotency(),
-                pending.eventLogId().toString(),
-                cause));
-    }
 }
 ```
 
-Return type is `void` — `eventBus.publish()` is fire-and-forget. The event is enqueued in Vert.x's event bus and delivered to all consumers asynchronously. This is the correct semantic: the publisher does not wait for consumers to finish processing.
+`eventBus.publish()` delivers to all consumers — `WorkflowExecutionCompletedHandler` (applies output, resumes case) and `PlanItemCompletionHandler` (marks PlanItems COMPLETED). Using `request()` instead would be point-to-point and silently break one of the two handlers. This is the same bug documented in the engine's 2026-04-22 diary entry (`CaseStartedEventHandler` used `request()` and caused rotating delivery).
 
-**`WorkerStatusPublisher`** — lifecycle notifications. Method names mirror `ReactiveWorkerStatusListener` exactly:
+**`WorkerStatusPublisher`** — lifecycle notifications. Names mirror `ReactiveWorkerStatusListener` exactly:
 
 ```java
 @ApplicationScoped
 public class WorkerStatusPublisher {
     @Inject ReactiveWorkerStatusListener reactiveWorkerStatusListener;
-
     public Uni<Void> onWorkerStarted(String dispatchId, Map<String, String> sessionMeta) { ... }
     public Uni<Void> onWorkerCompleted(String dispatchId, WorkResult result) { ... }
     public Uni<Void> onWorkerStalled(String dispatchId) { ... }
 }
 ```
 
-`WorkerStatusPublisher` is for observability notifications. It is NOT the case resumption mechanism. `WorkflowCompletionPublisher` is what resumes the case.
-
 **`WorkerProvisionerSupport`**:
+- `validateCapabilities(Set<String> requested, Set<String> supported)` — throws `WorkerProvisioningException` if **any** requested capability is absent. Void return — strict all-or-nothing guard. **Not appropriate for `provision()`** where the engine passes all capabilities and the provisioner handles a subset.
+- `tenancyId(ProvisionContext ctx)`, `wrap(Throwable t, String capability)`.
 
-- `validateCapabilities(Set<String> requested, Set<String> supported)` — throws `WorkerProvisioningException` if **any** capability in `requested` is absent from `supported`. Void return — it is a strict all-or-nothing guard. **Not appropriate for `provision()`** where the engine passes all capabilities and the provisioner handles a subset. Use `resolver.firstMatch(capabilities)` in provision() instead.
-- `tenancyId(ProvisionContext ctx)` — extracts tenancyId.
-- `wrap(Throwable t, String capability)` — converts to `WorkerProvisioningException.startupFailed()`.
-
-**`AsyncWorkerCompletionRegistry`** — generates `dispatchId` and `callbackToken` at registration time:
+**`AsyncWorkerCompletionRegistry`**:
 
 ```java
 @ApplicationScoped
 public class AsyncWorkerCompletionRegistry {
     @Inject Event<CompletionExpiredEvent> expiryEvents;
 
-    /**
-     * Register an async dispatch. Registry generates dispatchId and callbackToken.
-     * Returns PendingCompletion with these generated values.
-     */
+    /** Registry generates dispatchId (UUID) and callbackToken (UUID). */
     PendingCompletion register(WorkerCorrelationContext ctx, Capability capability,
                                Long eventLogId, Duration ttl, Map<String, String> provisionerMeta);
 
-    /** Remove and return; empty if dispatchId unknown or already completed. */
+    /** Remove and return; empty if dispatchId unknown or already completed (idempotent). */
     Optional<PendingCompletion> complete(String dispatchId);
 
     /** Count active dispatches for a given worker name (for getActiveWorkCount). */
     int countByWorkerName(String workerName);
 
-    /** Scheduled: removes expired entries and fires CompletionExpiredEvent per entry. */
+    /**
+     * Scheduled: removes expired entries and fires CompletionExpiredEvent per entry.
+     * Fires CDI async — workers-common does not know about engine event bus addresses.
+     */
     void expireStale();
 }
 ```
 
-TTL: `casehub.workers.async.timeout-minutes` (default: 60). Expiry fires `CompletionExpiredEvent` (CDI async) — workers-camel observes this to fire `WorkflowExecutionFailed`. `workers-common` does not know about the engine event bus.
+TTL: `casehub.workers.async.timeout-minutes` (default: 60).
 
-**Deployment constraint — sticky routing:** The registry is JVM-local. `POST /workers/complete/{dispatchId}` must reach the same JVM that registered the completion. Multi-node deployments require sticky load balancing keyed on `dispatchId`, or a distributed registry implementation. This is a deployment constraint, documented here and in operator docs.
+**Deployment constraint:** Registry is JVM-local. `POST /workers/complete/{dispatchId}` must reach the originating JVM. Multi-node deployments require sticky load balancing or a distributed registry.
 
-**`WorkerCallbackResource`** — REST endpoint shared by all worker types. Path parameter is `dispatchId` (the UUID from `PendingCompletion`):
+**`WorkerCallbackResource`**:
 
 ```
 POST /workers/complete/{dispatchId}
@@ -253,80 +227,97 @@ Headers: X-Casehub-Callback-Token: <token>
 Body: WorkerCompletionPayload
 ```
 
-Validates `X-Casehub-Callback-Token` against stored `callbackToken` using constant-time comparison (`MessageDigest.isEqual`). Calls `AsyncWorkerCompletionRegistry.complete(dispatchId)`. If present: calls `WorkflowCompletionPublisher.complete()` (success) or `WorkflowCompletionPublisher.fail()` (faulted). Returns 200 idempotently (returns 200 even if `dispatchId` already resolved). Returns 404 only if `dispatchId` was never registered. Returns 401 on missing or mismatched token.
+Validates token constant-time. Calls `AsyncWorkerCompletionRegistry.complete(dispatchId)`. On success: calls `WorkflowCompletionPublisher.complete()` (faulted=false) or notifies via fault path (faulted=true — how the fault is signalled is worker-specific; the resource calls an injected `WorkerFaultNotifier` SPI, described in Section 5.9). Returns 200 idempotently; 404 if `dispatchId` never registered; 401 on bad token.
 
-`WorkerCallbackResource` runs on a Vert.x IO thread. All operations it performs are non-blocking: `ConcurrentHashMap` lookup in the registry + `eventBus.publish()`. No `@Blocking` annotation required.
+**`WorkerFaultNotifier` SPI** — `workers-common` needs to notify on fault from `WorkerCallbackResource` without knowing the Camel event bus address. This SPI decouples the resource from the address:
+
+```java
+public interface WorkerFaultNotifier {
+    void notifyFault(PendingCompletion pending, String errorMessage);
+}
+```
+
+`CamelWorkerFaultNotifier` implements it in `workers-camel` and fires on `CAMEL_WORKER_FAULT`. `NoOpWorkerFaultNotifier @DefaultBean` is the fallback.
 
 ---
 
 ## 5. `workers-camel`
 
-Depends on `workers-common`. Implements `ReactiveWorkerProvisioner`, `WorkerExecutionManager`, and `CamelWorkerFailureHandler`.
+Depends on `workers-common`. Implements `ReactiveWorkerProvisioner`, `WorkerExecutionManager`, `CamelWorkerFaultEventHandler`, `CamelCompletionExpiryObserver`.
 
-### 5.1 Capability-to-route resolution — `CamelCapabilityResolver`
-
-Implements `WorkerCapabilityResolver<String>`. Three-tier resolution:
-
-**Priority 1 — SPI (highest):** CDI-discovered `CamelWorkerRoute @ApplicationScoped` beans:
+### 5.1 `CamelWorkerEventBusAddresses`
 
 ```java
-public interface CamelWorkerRoute {
-    Set<String> getCapabilities();
-    String getEntryUri();
-    ExchangePattern exchangePattern();  // AUTHORITATIVE — mismatch vs Camel route is startup error
+public final class CamelWorkerEventBusAddresses {
+    /** Published by CamelWorkerFaultPublisher for all Camel worker faults (sync and async). */
+    public static final String CAMEL_WORKER_FAULT = "casehub.workers.camel.fault";
 }
 ```
 
-`exchangePattern()` is authoritative. On startup, `CamelWorkerExecutionManager` validates that the registered Camel route's `ExchangePattern` matches the declared value. A mismatch throws `IllegalStateException` with the route ID, declared pattern, and observed pattern. This validation applies only to SPI-registered routes — convention and config routes have no `CamelWorkerRoute` bean, so their exchange pattern is read directly from the Camel route's `ExchangePattern` as registered in `CamelContext`.
+This address is separate from `EventBusAddresses.WORKFLOW_EXECUTION_FAILED` (Quartz/Flow). `QuartzWorkerExecutionJobListener` never sees events on `CAMEL_WORKER_FAULT`. `CamelWorkerFaultEventHandler` never sees events on `WORKFLOW_EXECUTION_FAILED`.
 
-**Priority 2 — Config:** `casehub.workers.camel.capabilities.<tag> = <camelUri>`. Any full Camel URI is valid: `direct:my-route`, `kafka:my-topic?brokers=localhost:9092`, etc. Exchange pattern inferred from the route's observed `ExchangePattern` in `CamelContext`.
+### 5.2 `CamelWorkerFaultPublisher`
 
-**Priority 3 — Convention (lowest):** Both conditions must hold simultaneously:
-1. A route with ID exactly equal to the capability tag exists in `CamelContext`.
-2. The route's first `from:` URI is `direct:{capabilityTag}`.
+Fires Camel faults. Reuses `WorkflowExecutionFailed` type (carries all needed retry context) but on the Camel-specific address:
 
-Neither condition alone is sufficient. A route with matching ID but a different entry URI does not satisfy convention and falls through to `WorkerProvisioningException`.
-
-**`firstMatch(Set<String>)`** — returns the first capability in the set (by iteration order) that has a registered route in any tier. Used by `provision()` to handle partial overlaps.
-
-**Multi-capability dispatch:** One route per dispatch. `firstMatch()` picks the first resolvable capability. The engine schedules capabilities independently.
-
-**Startup ordering:** Capabilities and exchange patterns are computed in a `@Observes @Priority(APPLICATION) StartupEvent` handler — after Camel routes are registered in `CamelContext`. `@PostConstruct` alone fires before Camel routes are ready. The computed capability set is cached; `getCapabilities()` on `ReactiveWorkerProvisioner` reads the cache.
-
-### 5.2 Route definition
-
-YAML DSL and programmatic `RouteBuilder` CDI beans are both supported. Quarkus Camel loads both into the same `CamelContext`.
-
-YAML (convention-based — route ID = capability tag, entry URI = `direct:{capabilityTag}`):
-```yaml
-- route:
-    id: lead-enrichment
-    from:
-      uri: direct:lead-enrichment
-    steps:
-      - to:
-          uri: salesforce:Lead?...
-      - to:
-          uri: casehub:complete
-```
-
-Programmatic (SPI-based — can inject `EndpointRegistry` once platform#73 ships):
 ```java
 @ApplicationScoped
-public class LeadEnrichmentRoute extends RouteBuilder implements CamelWorkerRoute {
-    @Override
-    public void configure() {
-        from("direct:lead-enrichment")
-            .to("salesforce:Lead?...")
-            .to("casehub:complete");
+public class CamelWorkerFaultPublisher {
+    @Inject EventBus eventBus;
+
+    public void fault(PendingCompletion pending, Throwable cause) {
+        eventBus.publish(CamelWorkerEventBusAddresses.CAMEL_WORKER_FAULT,
+            new WorkflowExecutionFailed(
+                pending.correlationContext().caseInstance(),
+                pending.correlationContext().worker(),
+                pending.capability(),
+                pending.correlationContext().idempotency(),   // = inputDataHash
+                pending.eventLogId().toString(),
+                cause));
     }
-    @Override public Set<String> getCapabilities()    { return Set.of("lead-enrichment"); }
-    @Override public String getEntryUri()              { return "direct:lead-enrichment"; }
-    @Override public ExchangePattern exchangePattern() { return ExchangePattern.InOnly; }
+
+    /** For faults detected without a PendingCompletion (e.g. sync path). */
+    public void fault(WorkerCorrelationContext ctx, Capability capability,
+                      Long eventLogId, Throwable cause) {
+        eventBus.publish(CamelWorkerEventBusAddresses.CAMEL_WORKER_FAULT,
+            new WorkflowExecutionFailed(
+                ctx.caseInstance(), ctx.worker(), capability,
+                ctx.idempotency(), eventLogId.toString(), cause));
+    }
 }
 ```
 
-### 5.3 `CamelReactiveWorkerProvisioner`
+Also implements `WorkerFaultNotifier` (Section 4.2) for REST callback path:
+```java
+@Override
+public void notifyFault(PendingCompletion pending, String errorMessage) {
+    fault(pending, errorMessage != null ? new RuntimeException(errorMessage) : null);
+}
+```
+
+### 5.3 Capability-to-route resolution — `CamelCapabilityResolver`
+
+Implements `WorkerCapabilityResolver<String>`. Three-tier resolution (SPI → Config → Convention — unchanged from v3). `CamelCapabilityResolver` itself observes `StartupEvent @Priority(APPLICATION)` to initialize the capability cache. This ensures both `CamelReactiveWorkerProvisioner.getCapabilities()` and `CamelWorkerExecutionManager.submit()` read from a populated cache regardless of which bean is activated first:
+
+```java
+@ApplicationScoped
+public class CamelCapabilityResolver implements WorkerCapabilityResolver<String> {
+
+    @Observes @Priority(APPLICATION)
+    void onStartup(StartupEvent ev) {
+        this.initialize();  // idempotent; safe if called multiple times
+    }
+    // ...
+}
+```
+
+Exchange pattern validation for SPI-registered `CamelWorkerRoute` beans runs in the same `onStartup()` — `exchangePattern()` vs actual Camel route pattern. Mismatch → `IllegalStateException`. Convention and config routes are trusted to declare correct patterns in their Camel DSL — no external validation possible.
+
+**Multi-capability dispatch:** `firstMatch(Set<String>)` returns the first resolvable capability. One route per dispatch. The engine schedules capabilities independently.
+
+**Convention:** Both conditions must hold — route ID = capability tag AND `from: direct:{capabilityTag}`. Either alone is insufficient.
+
+### 5.4 `CamelReactiveWorkerProvisioner`
 
 ```java
 @ApplicationScoped
@@ -334,57 +325,57 @@ public class CamelReactiveWorkerProvisioner implements ReactiveWorkerProvisioner
 
     @Override
     public Uni<ProvisionResult> provision(Set<String> capabilities, ProvisionContext context) {
-        // Engine passes all capabilities from the case definition. Use firstMatch —
-        // validateCapabilities() would throw if any capability is unsupported, but the
-        // provisioner is expected to handle a subset only.
+        // Engine passes ALL case capabilities; use firstMatch — validateCapabilities() is wrong
+        // here because it rejects any unsupported capability, but the engine expects partial match.
         String capability = camelCapabilityResolver.firstMatch(capabilities)
             .orElseThrow(() -> WorkerProvisioningException.noRouteFound(capabilities.toString()));
-        camelCapabilityResolver.resolve(capability); // validates route exists; throws if not
+        camelCapabilityResolver.resolve(capability); // validates route registered; throws if not
         return Uni.createFrom().item(ProvisionResult.empty());
     }
 
     @Override
     public Uni<Void> terminate(String workerId) {
-        return Uni.createFrom().voidItem(); // Camel routes are always-running; no per-worker teardown
+        return Uni.createFrom().voidItem(); // routes are always-running
     }
 
     @Override
     public Uni<Set<String>> getCapabilities() {
+        // CamelCapabilityResolver.onStartup() guarantees cache is populated before any engine call
         return Uni.createFrom().item(camelCapabilityResolver.capabilities());
     }
 }
 ```
 
-### 5.4 `CamelWorkerExecutionManager`
+### 5.5 `CamelWorkerExecutionManager`
 
 ```java
 @ApplicationScoped
 public class CamelWorkerExecutionManager implements WorkerExecutionManager {
 
-    @Observes @Priority(APPLICATION)
-    void onStartup(StartupEvent ev) {
-        camelCapabilityResolver.initialize();      // compute and cache capability set
-        validateSpiRoutePatternConsistency();       // SPI routes only — see Section 5.1
-    }
-
     @Override
     public Uni<Void> submit(Long eventLogId, CaseInstance instance, Worker worker,
                             Capability capability, Map<String, Object> inputData) {
-        String entryUri = camelCapabilityResolver.resolve(capability.getName());
-        if (entryUri == null) {
-            // Route was removed after startup — operator error. Log and return.
-            LOG.errorf("Camel route for capability %s not found at dispatch time — dropping",
-                capability.getName());
+        String entryUri;
+        try {
+            entryUri = camelCapabilityResolver.resolve(capability.getName());
+        } catch (WorkerProvisioningException e) {
+            // Route removed after startup — operator error. Fire fault so case eventually fails
+            // rather than hanging WAITING indefinitely.
+            LOG.errorf("Camel route for capability %s missing at dispatch time", capability.getName());
+            camelWorkerFaultPublisher.fault(
+                new WorkerCorrelationContext(instance, worker,
+                    WorkerExecutionKeys.inputDataHash(instance.getUuid(), worker.getName(),
+                        capability.getName(), inputData), instance.tenancyId),
+                capability, eventLogId, e);
             return Uni.createFrom().voidItem();
         }
 
         String idempotency = WorkerExecutionKeys.inputDataHash(
             instance.getUuid(), worker.getName(), capability.getName(), inputData);
-
         WorkerCorrelationContext ctx = new WorkerCorrelationContext(
             instance, worker, idempotency, instance.tenancyId);
-
         ExchangePattern pattern = camelCapabilityResolver.exchangePattern(capability.getName());
+
         return pattern == ExchangePattern.InOut
             ? submitSync(ctx, entryUri, capability, inputData, eventLogId)
             : submitAsync(ctx, entryUri, capability, eventLogId, inputData);
@@ -402,65 +393,59 @@ public class CamelWorkerExecutionManager implements WorkerExecutionManager {
 }
 ```
 
-Route not found at `submit()` time (route removed after startup): log ERROR, return `Uni.voidItem()`. This is an operator error — no `WorkflowExecutionFailed` is fired because there is nothing to retry. The case will eventually time out or be handled by the engine's watchdog.
+Missing route at `submit()` time fires on `CAMEL_WORKER_FAULT` — `CamelWorkerFaultEventHandler` handles retry/exhaustion. If the route is permanently gone, retries also fail quickly, exhausting the retry count and firing `WORKER_RETRIES_EXHAUSTED`. The case does not hang.
 
-### 5.5 Sync path (ExchangePattern.InOut)
+### 5.6 Sync path (ExchangePattern.InOut)
 
 ```java
 private Uni<Void> submitSync(WorkerCorrelationContext ctx, String entryUri,
                               Capability capability, Map<String, Object> inputData,
                               Long eventLogId) {
     return Uni.createFrom()
-        .item(() -> buildExchange(ctx, capability, inputData))
+        .item(() -> producerTemplate.request(entryUri, buildExchange(ctx, capability, inputData)))
         .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
-        .flatMap(exchange -> {
-            Exchange response = producerTemplate.request(entryUri, exchange);
+        .flatMap(response -> {
             boolean faulted = response.getException() != null
                 || "FAULTED".equals(response.getIn().getHeader(CasehubWorkerHeaders.WORK_STATUS));
-
             if (faulted) {
-                completionPublisher.fail(buildPendingForFault(ctx, capability, eventLogId),
-                                         response.getException());
-                return Uni.createFrom().voidItem();
+                camelWorkerFaultPublisher.fault(ctx, capability, eventLogId, response.getException());
+            } else {
+                completionPublisher.complete(ctx, extractOutput(response));
             }
-            completionPublisher.complete(ctx, extractOutput(response));
             return Uni.createFrom().voidItem();
         })
         .onFailure().call(t -> {
-            completionPublisher.fail(buildPendingForFault(ctx, capability, eventLogId), t);
+            camelWorkerFaultPublisher.fault(ctx, capability, eventLogId, t);
             return Uni.createFrom().voidItem();
         });
 }
 ```
 
-Sync faults fire `WorkflowExecutionFailed` (via `completionPublisher.fail()`). `WorkflowExecutionFailed` is then handled by `CamelWorkerFailureHandler` for retry (Section 5.7). `submit()` itself returns `Uni.voidItem()` regardless — the failure is handled asynchronously via the event bus.
+Faults fire on `CAMEL_WORKER_FAULT`. `submit()` always returns `Uni.voidItem()` — fault handling is asynchronous via the event bus.
 
-### 5.6 Async path (ExchangePattern.InOnly)
+### 5.7 Async path (ExchangePattern.InOnly)
 
 ```java
 private Uni<Void> submitAsync(WorkerCorrelationContext ctx, String entryUri,
                                Capability capability, Long eventLogId,
                                Map<String, Object> inputData) {
     PendingCompletion pending = asyncWorkerCompletionRegistry.register(
-        ctx, capability, eventLogId,
-        Duration.ofMinutes(asyncTimeoutMinutes), Map.of());
+        ctx, capability, eventLogId, Duration.ofMinutes(asyncTimeoutMinutes), Map.of());
 
     Exchange exchange = buildExchange(ctx, capability, inputData);
-    // dispatchId is the casehub-worker-id — external systems include it in their callback URL
     exchange.getIn().setHeader(CasehubWorkerHeaders.WORKER_ID, pending.dispatchId());
     exchange.getIn().setHeader(CasehubWorkerHeaders.CALLBACK_TOKEN, pending.callbackToken());
 
     return Uni.createFrom().voidItem()
         .invoke(() -> producerTemplate.send(entryUri, exchange));
-    // Returns immediately. Completion via casehub:complete or POST /workers/complete/{dispatchId}
 }
 ```
 
-### 5.7 Exchange input mapping
+### 5.8 Exchange input mapping
 
 | Header (`CasehubWorkerHeaders`) | Value |
 |---|---|
-| `casehub-worker-id` | `pending.dispatchId()` — per-dispatch UUID; NOT `worker.getName()` |
+| `casehub-worker-id` | `pending.dispatchId()` — per-dispatch UUID |
 | `casehub-idempotency` | `ctx.idempotency()` — `WorkerExecutionKeys.inputDataHash(...)` |
 | `casehub-case-id` | `instance.getUuid().toString()` |
 | `casehub-tenancy-id` | `instance.tenancyId` |
@@ -469,113 +454,163 @@ private Uni<Void> submitAsync(WorkerCorrelationContext ctx, String entryUri,
 
 Body: `inputData` serialised as JSON.
 
-### 5.8 `CasehubCamelComponent` — `casehub:complete`
+### 5.9 `CasehubCamelComponent` — `casehub:complete`
 
-Camel `Processor.process(Exchange)` is synchronous. Camel component processor threads are standard Java threads (Camel uses its own thread pool, not Vert.x IO threads). Calling blocking operations from `process()` is safe.
-
-`WorkflowCompletionPublisher.complete/fail()` call `eventBus.publish()` which is non-blocking from Vert.x's perspective — it enqueues the event and returns immediately. The processor blocks briefly on this enqueue and then returns. The Vert.x event bus consumers (`WorkflowExecutionCompletedHandler`, `PlanItemCompletionHandler`, `CamelWorkerFailureHandler`) process the event asynchronously after the processor returns. This is the correct semantic — the Camel exchange completes and the engine resumes the case asynchronously.
+Camel `Processor.process(Exchange)` is synchronous. Camel threads are standard Java threads (not Vert.x IO threads). `eventBus.publish()` is non-blocking — it enqueues and returns immediately. The processor blocks briefly on the publish call and then returns. Engine consumers process the event asynchronously.
 
 ```java
 @Override
 public void process(Exchange exchange) throws Exception {
     String dispatchId = exchange.getIn().getHeader(CasehubWorkerHeaders.WORKER_ID, String.class);
     if (dispatchId == null) {
-        throw new IllegalStateException(
-            "casehub-worker-id header missing — route must stamp it from the incoming exchange");
+        throw new IllegalStateException("casehub-worker-id header missing on casehub:complete");
+    }
+
+    Optional<PendingCompletion> pending = asyncWorkerCompletionRegistry.complete(dispatchId);
+    if (pending.isEmpty()) {
+        LOG.warnf("casehub:complete — dispatchId %s not found (already resolved or expired)", dispatchId);
+        return;
     }
 
     boolean faulted = exchange.getException() != null
         || "FAULTED".equals(exchange.getIn().getHeader(CasehubWorkerHeaders.WORK_STATUS));
 
-    Optional<PendingCompletion> pending = asyncWorkerCompletionRegistry.complete(dispatchId);
-    if (pending.isEmpty()) {
-        LOG.warnf("casehub:complete — dispatchId %s not in registry (already completed or expired)", dispatchId);
-        return;
-    }
-
     if (faulted) {
-        completionPublisher.fail(pending.get(), exchange.getException());
+        camelWorkerFaultPublisher.fault(pending.get(), exchange.getException());
     } else {
         Map<String, Object> output = exchange.getIn().getBody(Map.class);
-        if (output == null) output = Map.of();
-        completionPublisher.complete(pending.get().correlationContext(), output);
+        completionPublisher.complete(pending.get().correlationContext(),
+                                     output != null ? output : Map.of());
     }
-    // publish() is non-blocking; returns without waiting for consumers to process the event
 }
 ```
 
-Body contract for route authors: set exchange body to `Map<String, Object>` before routing to `casehub:complete`. Non-Map body (String, POJO, null) → treated as empty output `Map.of()`.
+Body contract: set exchange body to `Map<String, Object>` before routing to `casehub:complete`. Non-Map body → treated as `Map.of()`.
 
-### 5.9 Fault path and retry — `CamelWorkerFailureHandler`
+### 5.10 Fault handling — two separate beans
 
-The fault path for Camel workers mirrors `QuartzWorkerExecutionJobListener`'s role for Quartz workers. `CamelWorkerFailureHandler` in `workers-camel` handles both:
-- Explicit faults (sync exception or FAULTED status in `casehub:complete`)
-- Timeout faults (async expiry via `CompletionExpiredEvent` CDI event)
+**`CamelWorkerFaultEventHandler`** — handles Vert.x event bus events on `CAMEL_WORKER_FAULT`:
 
 ```java
 @ApplicationScoped
-public class CamelWorkerFailureHandler {
+public class CamelWorkerFaultEventHandler {
 
-    /** Handle faults from sync and async-explicit paths. */
-    @ConsumeEvent(value = EventBusAddresses.WORKFLOW_EXECUTION_FAILED, blocking = true)
-    public Uni<Void> onFault(WorkflowExecutionFailed event) {
-        // Only handle capabilities this Camel manager knows about
-        if (!camelCapabilityResolver.capabilities().contains(event.capability().getName())) {
-            return Uni.createFrom().voidItem();
-        }
-        return handleFailure(event.caseInstance(), event.worker(), event.capability(),
-                             event.inputDataHash(), event.eventLogId(), event.cause());
-    }
+    @ConsumeEvent(value = CamelWorkerEventBusAddresses.CAMEL_WORKER_FAULT, blocking = true)
+    public void onFault(WorkflowExecutionFailed event) {
+        CaseInstance instance = event.caseInstance();
+        Worker worker = event.worker();
+        String inputDataHash = event.inputDataHash();
+        String tenancyId = instance.tenancyId;
 
-    /** Handle async timeout via CDI event from AsyncWorkerCompletionRegistry.expireStale(). */
-    void onExpiry(@ObservesAsync CompletionExpiredEvent event) {
-        PendingCompletion pending = event.pending();
-        handleFailure(
-            pending.correlationContext().caseInstance(),
-            pending.correlationContext().worker(),
-            pending.capability(),
-            pending.correlationContext().idempotency(),
-            pending.eventLogId().toString(),
-            null /* no cause for timeout */)
-        .subscribe().with(ignored -> {}, err -> LOG.errorf(err, "Expiry fault handling failed"));
-    }
+        // 1. Persist WORKER_EXECUTION_FAILED — countFailedAttempts queries this count
+        EventLog failureLog = new EventLog();
+        failureLog.setCaseId(instance.getUuid());
+        failureLog.setWorkerId(worker.getName());
+        failureLog.setEventType(CaseHubEventType.WORKER_EXECUTION_FAILED);
+        failureLog.setStreamType(EventStreamType.CASE);
+        failureLog.setTimestamp(Instant.now());
+        failureLog.setMetadata(OBJECT_MAPPER.createObjectNode()
+            .put("inputDataHash", inputDataHash)
+            .put("errorMessage", event.cause() != null ? event.cause().getMessage() : "unknown"));
 
-    private Uni<Void> handleFailure(CaseInstance instance, Worker worker, Capability capability,
-                                     String inputDataHash, String eventLogId, Throwable cause) {
-        return eventLogRepository
-            .persistWorkerExecutionFailed(instance, worker, inputDataHash, instance.tenancyId)
-            .flatMap(ignored -> countFailures(instance.getUuid(), worker.getName(), inputDataHash))
+        eventLogRepository.append(failureLog, tenancyId)
+            .flatMap(ignored -> countFailedAttempts(instance.getUuid(), worker.getName(),
+                                                    inputDataHash, tenancyId))
             .flatMap(failureCount -> {
-                int maxRetries = worker.getExecutionPolicy().maxRetries();
-                if (failureCount <= maxRetries) {
-                    // Retry: reload inputData from event log, re-dispatch
-                    return reloadAndResubmit(instance, worker, capability, eventLogId);
+                RetryPolicy retryPolicy = resolveRetryPolicy(instance, worker);
+                if (retryPolicy != null && failureCount < retryPolicy.maxAttempts()) {
+                    long delayMs = computeBackoffDelayMs(retryPolicy, failureCount + 1);
+                    return reloadAndResubmit(event, delayMs);
                 } else {
-                    // Exhausted: publish WORKER_RETRIES_EXHAUSTED
+                    // Exhausted — WorkerRetriesExhaustedEvent.idempotency maps to inputDataHash
                     eventBus.publish(EventBusAddresses.WORKER_RETRIES_EXHAUSTED,
                         new WorkerRetriesExhaustedEvent(
                             instance.getUuid(), worker.getName(), inputDataHash));
                     return Uni.createFrom().voidItem();
                 }
-            });
+            })
+            .subscribe().with(ignored -> {}, ex ->
+                LOG.errorf(ex, "Fault handling failed for worker %s case %s",
+                           worker.getName(), instance.getUuid()));
     }
 
-    private Uni<Void> reloadAndResubmit(CaseInstance instance, Worker worker,
-                                          Capability capability, String eventLogId) {
-        // Load inputData from the scheduled event log entry (same approach as QuartzWorkerExecutionJob)
-        return eventLogRepository.findById(Long.parseLong(eventLogId), instance.tenancyId)
+    private Uni<Long> countFailedAttempts(UUID caseId, String workerId,
+                                           String inputDataHash, String tenancyId) {
+        // Mirror of QuartzWorkerExecutionJobListener.countFailedAttempts()
+        return eventLogRepository
+            .findByCaseAndWorkerAndType(caseId, workerId, CaseHubEventType.WORKER_EXECUTION_FAILED, tenancyId)
+            .map(logs -> logs.stream()
+                .filter(log -> {
+                    JsonNode meta = log.getMetadata();
+                    JsonNode node = meta == null ? null : meta.get("inputDataHash");
+                    return node != null && inputDataHash.equals(node.asText());
+                })
+                .count());
+    }
+
+    private RetryPolicy resolveRetryPolicy(CaseInstance instance, Worker worker) {
+        // Mirror of QuartzWorkerExecutionJobListener.resolveRetryPolicy()
+        ExecutionPolicy policy = worker.getExecutionPolicy();
+        if (policy == null || policy.retries() == null) {
+            return null;  // no retries configured
+        }
+        return policy.retries();
+    }
+
+    /** Same computation as QuartzWorkerExecutionJobListener.computeBackoffDelayMs(). */
+    private static long computeBackoffDelayMs(RetryPolicy policy, long attemptNumber) {
+        long baseDelayMs = policy.delayMs() != null ? policy.delayMs() : 0L;
+        BackoffStrategy strategy = policy.backoffStrategy() != null
+            ? policy.backoffStrategy() : BackoffStrategy.FIXED;
+        return switch (strategy) {
+            case FIXED -> baseDelayMs;
+            case EXPONENTIAL -> {
+                long shift = Math.min(attemptNumber - 1, 30);
+                yield Math.min(baseDelayMs * (1L << shift), 30_000L);
+            }
+            case EXPONENTIAL_WITH_JITTER -> {
+                long shift = Math.min(attemptNumber - 1, 30);
+                long cap = Math.min(baseDelayMs * (1L << shift), 30_000L);
+                yield cap == 0 ? 0 : ThreadLocalRandom.current().nextLong(cap + 1);
+            }
+        };
+    }
+
+    private Uni<Void> reloadAndResubmit(WorkflowExecutionFailed event, long delayMs) {
+        return eventLogRepository
+            .findById(Long.parseLong(event.eventLogId()), event.caseInstance().tenancyId)
             .flatMap(eventLog -> {
-                Map<String, Object> inputData = objectMapper.convertValue(eventLog.getPayload(), MAP_TYPE);
-                return workerExecutionManager.submit(
-                    Long.parseLong(eventLogId), instance, worker, capability, inputData);
+                Map<String, Object> inputData =
+                    OBJECT_MAPPER.convertValue(eventLog.getPayload(), MAP_TYPE);
+                return Uni.createFrom().completionStage(() ->
+                    CompletableFuture.runAsync(
+                        () -> {}, CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS)))
+                    .flatMap(ignored -> camelWorkerExecutionManager.submit(
+                        Long.parseLong(event.eventLogId()),
+                        event.caseInstance(), event.worker(), event.capability(), inputData));
             });
     }
 }
 ```
 
-**Retry count source:** query `WORKER_EXECUTION_FAILED` event log entries for `(caseId, workerName, inputDataHash)`. Same approach as Quartz — the event log is the source of truth for retry count.
+`reloadAndResubmit()` calls `camelWorkerExecutionManager.submit()` directly, bypassing `WorkerScheduleEventHandler.scheduleUnderLock()`. **Known gap:** concurrent expiry events (e.g., two `expireStale()` scheduler ticks before the first is processed) could produce two retry dispatches. Since `AsyncWorkerCompletionRegistry.complete(dispatchId)` uses `ConcurrentHashMap.remove()` (atomic), the first caller wins and the second gets `Optional.empty()`. The gap is narrow and bounded: it can only occur when `expireStale()` is scheduled faster than it completes, which is prevented by keeping TTL much larger than the scheduler interval. Document as known; add a scheduled-interval guard in configuration.
 
-**Retry re-dispatch:** loads `inputData` from the original event log entry (same as `QuartzWorkerExecutionJob.execute()`), then re-calls `submit()`. The new dispatch generates a fresh `dispatchId` and `callbackToken`.
+**`CamelCompletionExpiryObserver`** — separate CDI bean observing async CDI events. Splits event dispatch mechanisms cleanly:
+
+```java
+@ApplicationScoped
+public class CamelCompletionExpiryObserver {
+
+    @Inject CamelWorkerFaultPublisher faultPublisher;
+
+    void onExpiry(@ObservesAsync CompletionExpiredEvent event) {
+        PendingCompletion pending = event.pending();
+        faultPublisher.fault(pending, new RuntimeException("Async timeout — no completion received"));
+    }
+}
+```
+
+`CamelWorkerFaultEventHandler` then handles the resulting `CAMEL_WORKER_FAULT` event via its normal path.
 
 ---
 
@@ -586,7 +621,7 @@ MockAsyncWorkerCompletionRegistry    — captures registrations; exposes trigger
 CapturingWorkerStatusPublisher       — records all onWorkerStarted/Completed/Stalled calls
 TestCamelWorkerRoute                 — sample CamelWorkerRoute SPI impl; exchange pattern configurable
 WorkflowCompletionCaptor             — captures WorkflowExecutionCompleted events on event bus
-WorkflowFailureCaptor                — captures WorkflowExecutionFailed events on event bus
+CamelWorkerFaultCaptor               — captures WorkflowExecutionFailed events on CAMEL_WORKER_FAULT
 WorkerTestSupport                    — static helpers: correlationContext(instance, worker), completedPayload(output), faultedPayload(msg)
 ```
 
@@ -598,34 +633,30 @@ Never compile or runtime dependency — test scope only.
 
 ### `workers-common`
 
-- `AsyncWorkerCompletionRegistry`: `register()` → unique `dispatchId` per call; two concurrent `register()` calls for same `worker.getName()` → different `dispatchId` keys, both resolvable
-- `complete(dispatchId)` → success; second `complete()` → empty (idempotent)
-- Wrong `callbackToken` → rejected before registry lookup (401 path in `WorkerCallbackResource`)
-- `expireStale()` → fires `CompletionExpiredEvent` CDI event per expired entry
-- `WorkerCallbackResource`: 200 on valid token; 401 on wrong token; 404 on unknown `dispatchId`; 200 idempotent on second call
-- `WorkflowCompletionPublisher`: verify `eventBus.publish()` (not `request()`) on `WORKER_EXECUTION_FINISHED`; verify both `WorkflowExecutionCompletedHandler` and `PlanItemCompletionHandler` receive the event in a `@QuarkusTest`
+- `AsyncWorkerCompletionRegistry`: two concurrent `register()` calls for same `worker.getName()` → distinct `dispatchId` keys; both resolvable independently
+- `complete(dispatchId)` → success; second call → empty (idempotent)
+- Wrong `callbackToken` → 401 before registry lookup
+- `expireStale()` fires `CompletionExpiredEvent` CDI event per expired entry
 
 ### `workers-camel`
 
-- `CamelWorkerExecutionManager.submit()`: sync path — `WorkflowCompletionCaptor` asserts event fired with correct `idempotency`, `caseInstance`, `worker`, `output`; `casehub-worker-id` header = `dispatchId` UUID (not `worker.getName()`)
-- Sync fault: `WorkflowFailureCaptor` asserts `WorkflowExecutionFailed` fired on `WORKFLOW_EXECUTION_FAILED`
-- Async Path A: `PendingCompletion` registered; `submit()` returns immediately; `casehub:complete` fires `WorkflowExecutionCompleted`
-- Async Path B: `POST /workers/complete/{dispatchId}` with valid token fires `WorkflowExecutionCompleted`; wrong token → 401
-- Async fault via `casehub:complete` with FAULTED header: `WorkflowExecutionFailed` fired
-- Async expiry: `CompletionExpiredEvent` → `CamelWorkerFailureHandler.onExpiry()` → `WorkflowExecutionFailed`
-- `CamelWorkerFailureHandler`: retry below limit → `submit()` called again; exhausted → `WORKER_RETRIES_EXHAUSTED` published
-- Startup validation: `exchangePattern()` mismatch → `IllegalStateException` at startup
-- Convention: both conditions required (route ID AND `direct:{tag}` URI)
-- Config: full Camel URI in property overrides convention
-- SPI: `CamelWorkerRoute` bean overrides config
-- `schedulePersistedEvent()`: no-op, returns `Uni.voidItem()`
+- **NC1 isolation:** `CamelWorkerFaultEventHandler` handles `CAMEL_WORKER_FAULT`; `QuartzWorkerExecutionJobListener` does NOT fire for Camel faults (separate address — verify in integration test that `findByCaseAndWorkerAndType(WORKER_EXECUTION_FAILED)` returns exactly 1 entry after a Camel fault, not 2)
+- Sync fault: `CamelWorkerFaultCaptor` asserts `WorkflowExecutionFailed` on `CAMEL_WORKER_FAULT`; exactly one `WORKER_EXECUTION_FAILED` event log entry written
+- Retry: `failureCount < retryPolicy.maxAttempts()` — strict `<`; verify backoff delay applied before re-dispatch
+- Retry exhaustion: when `failureCount >= maxAttempts()`, `WORKER_RETRIES_EXHAUSTED` published with correct `(caseId, workerId, inputDataHash)` — note `inputDataHash` maps to `WorkerRetriesExhaustedEvent.idempotency()` record component
+- `countFailedAttempts()`: filters by `metadata.get("inputDataHash")` — verify entries with different `inputDataHash` are not counted
+- Async timeout: `CompletionExpiredEvent` → `CamelCompletionExpiryObserver` → `CAMEL_WORKER_FAULT` → `CamelWorkerFaultEventHandler`
+- Missing route at `submit()`: fault fired, retry path runs, quickly exhausts if route stays missing
+- Startup: `CamelCapabilityResolver.initialize()` called via `StartupEvent` — `getCapabilities()` returns non-empty before any engine call
 
 ---
 
-## 8. Remaining open questions
+## 8. Remaining open questions (deferred)
 
-- `workers-common` migration to `casehub-engine` alongside Drools and Flow — deferred
-- `EndpointRegistry` integration (platform#73) — deferred
-- Distributed `AsyncWorkerCompletionRegistry` for multi-node — deferred; current in-memory registry requires sticky routing
-- Quartz and Camel retry count logic are now parallel implementations — consider extracting retry-count query and `WORKER_RETRIES_EXHAUSTED` logic to a shared utility in `casehub-engine-common` in a follow-on issue
-- Stale `CaseInstance` reference in long-lived registry — potential future improvement: reload fresh instance from `CrossTenantCaseInstanceRepository` at completion time; deferred to multi-node registry work
+- **Composite `WorkerExecutionManager` for Quartz + Camel co-deployment**: engine must support `@Any Instance<WorkerExecutionManager>` and route by worker type. Separate engine issue — Quartz + Camel single-classpath deployment is unsupported until resolved.
+- **`workers-common` migration to `casehub-engine`** alongside Drools and Flow
+- **`EndpointRegistry` integration** (platform#73)
+- **Distributed `AsyncWorkerCompletionRegistry`** for multi-node
+- **Retry count deduplication** for concurrent expiry events — add scheduler-interval guard configuration (`casehub.workers.camel.async.expiry-check-interval-minutes` must be `<< casehub.workers.async.timeout-minutes`)
+- **Stale `CaseInstance` reference**: reload fresh instance at completion time once multi-node registry ships
+- **`WorkerExecutionFailed` vs empty-output `WorkflowExecutionCompleted`**: Camel uses `WorkflowExecutionFailed` + retry path; confirm with engine team that empty-output `WorkflowExecutionCompleted` (previously proposed) would bypass retry machinery (confirmed it does — fault path is correct choice)
