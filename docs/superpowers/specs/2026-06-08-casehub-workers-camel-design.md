@@ -1,8 +1,8 @@
-# CaseHub Workers — Camel Worker Design (Revised v6)
+# CaseHub Workers — Camel Worker Design (Revised v7)
 
 **Date:** 2026-06-08
 **Status:** Approved — pending implementation plan
-**Revision:** v6 — fifth review cycle; ND1–ND3 + NM1–NM2 addressed
+**Revision:** v7 — sixth review cycle; threading bug (emitOn), dead injection, static fields, EventLog dep
 
 ---
 
@@ -101,7 +101,7 @@ public final class CamelWorkerEventBusAddresses {
 
 `workers-common` depends on:
 - `casehub-engine-api` — `ReactiveWorkerProvisioner`, `ReactiveWorkerStatusListener`, `ProvisionResult`, `ProvisionContext`, `WorkResult`, `Worker`, `Capability`, `ExecutionPolicy`, `RetryPolicy`, `BackoffStrategy`
-- `casehub-engine-common` — `WorkerExecutionManager`, `WorkflowExecutionCompleted`, `CaseInstance`, `EventBusAddresses`, `WorkerExecutionKeys`, `EventLogRepository`
+- `casehub-engine-common` — `WorkerExecutionManager`, `WorkflowExecutionCompleted`, `WorkflowExecutionFailed`, `CaseInstance`, `EventLog`, `EventBusAddresses`, `WorkerExecutionKeys`, `EventLogRepository`
 
 Same dependency pattern as claudony.
 
@@ -552,6 +552,10 @@ Body contract: set exchange body to `Map<String, Object>` before routing to `cas
 @ApplicationScoped
 public class CamelWorkerFaultEventHandler {
 
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
+    private static final Logger LOG = Logger.getLogger(CamelWorkerFaultEventHandler.class);
+
     // Inject WorkerExecutionManager by interface, not concrete type.
     // CDI resolves to CamelWorkerExecutionManager in a Camel-only deployment.
     // This keeps intra-module coupling on the SPI contract, consistent with
@@ -560,7 +564,8 @@ public class CamelWorkerFaultEventHandler {
     @Inject EventBus eventBus;
     @Inject EventLogRepository eventLogRepository;
     @Inject Vertx vertx;
-    @Inject CamelWorkerFaultPublisher camelWorkerFaultPublisher;
+    // camelWorkerFaultPublisher intentionally NOT injected here: fault publication on
+    // re-dispatch is handled inside workerExecutionManager.submit() when the route is missing.
 
     @ConsumeEvent(value = CamelWorkerEventBusAddresses.CAMEL_WORKER_FAULT, blocking = true)
     public void onFault(WorkflowExecutionFailed event) {
@@ -662,16 +667,20 @@ public class CamelWorkerFaultEventHandler {
                 Map<String, Object> inputData =
                     OBJECT_MAPPER.convertValue(eventLog.getPayload(), MAP_TYPE);
                 // Vert.x timer keeps async on one reactor (avoids ForkJoinPool).
-                // onTermination cancels the timer if the Uni is disposed before it fires
-                // (e.g., CDI context shutdown) — prevents timer accumulation.
-                // runSubscriptionOn switches to a worker thread before submit() —
-                // required because direct: Camel routes run synchronously, and
-                // the Vert.x timer fires on the event loop thread.
+                // onTermination cancels the timer on Uni disposal — prevents timer accumulation.
+                // emitOn (NOT runSubscriptionOn) is required here:
+                //   runSubscriptionOn moves the subscription lambda to the pool, but item
+                //   delivery still happens on whoever calls em.complete() — the Vert.x timer
+                //   callback, which runs on the event loop thread. The engine uses
+                //   runSubscriptionOn only with Uni.createFrom().item(() -> ...) where the
+                //   supplier both runs and emits on the pool (see ChainedReactiveActionRiskClassifier,
+                //   AbstractJpaRepository). emitOn intercepts between emitter and downstream
+                //   and re-dispatches to the pool, so submit() runs on a worker thread.
                 return Uni.createFrom().<Void>emitter(em -> {
                         long timerId = vertx.setTimer(delayMs, id -> em.complete(null));
                         em.onTermination(() -> vertx.cancelTimer(timerId));
                     })
-                    .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
+                    .emitOn(Infrastructure.getDefaultWorkerPool())
                     .flatMap(ignored -> workerExecutionManager.submit(
                         Long.parseLong(event.eventLogId()),
                         event.caseInstance(), event.worker(), event.capability(), inputData));
