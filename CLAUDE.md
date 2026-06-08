@@ -6,13 +6,13 @@ type: java
 
 ## Repository Role
 
-Integration-tier collection of CaseHub worker implementations. Each module implements the `WorkerProvisioner` (and optionally `CaseChannelProvider`, `WorkerStatusListener`) SPIs from `casehub-engine-api`, enabling CaseHub cases to dispatch work to different execution runtimes — HTTP endpoints, Apache Camel routes, shell scripts, Kubernetes Jobs, Lambda functions, and more.
+Integration-tier collection of CaseHub worker implementations. Each module provides `ReactiveWorkerProvisioner` and `WorkerExecutionManager` SPI implementations (from `casehub-engine-api` and `casehub-engine-common`) that allow CaseHub cases to dispatch work to different execution runtimes — HTTP endpoints, Apache Camel routes, shell scripts, Kubernetes Jobs, and more.
 
-**Tier:** Integration (sits alongside `claudony` and `casehub-openclaw` in the build order)
+**Tier:** Integration (alongside `claudony` and `casehub-openclaw` in the build order)
 
-**Design philosophy:** Thin wrappers — each worker module translates a CaseHub case step dispatch into the target runtime's protocol and reports back completion/failure. No domain logic lives here.
+**Design philosophy:** Thin wrappers — each worker module translates a CaseHub case step dispatch into the target runtime's protocol and fires `WorkflowExecutionCompleted` on `WORKER_EXECUTION_FINISHED` when done. No domain logic here.
 
-**Research doc:** `casehubio/parent` — `docs/superpowers/research/2026-06-07-desired-state-management-research.md`
+**Spec:** `docs/superpowers/specs/2026-06-08-casehub-workers-camel-design.md` — fully approved, 7 review cycles.
 
 ## Build Commands
 
@@ -26,55 +26,83 @@ mvn --batch-mode deploy -DskipTests
 
 ## Module Structure
 
-| Module | Artifact | Purpose |
-|--------|----------|---------|
-| `workers-http` | `casehub-workers-http` | Dispatch case steps to any HTTP/REST endpoint or webhook |
-| `workers-camel` | `casehub-workers-camel` | Apache Camel route execution — 300+ connectors (Kafka, AWS, Salesforce, SAP, FTP, DB) |
-| `workers-testing` | `casehub-workers-testing` | Test fixtures: NoOpWorkerProvisioner, CaptureWorkerProvisioner — **test scope only** |
+| Module | Artifact | Root package | Purpose |
+|--------|----------|-------------|---------|
+| `workers-common` | `casehub-workers-common` | `io.casehub.workers.common` | General async worker infrastructure — shared by all worker types |
+| `workers-http` | `casehub-workers-http` | `io.casehub.workers.http` | HTTP/webhook worker (skeleton — spec not yet written) |
+| `workers-camel` | `casehub-workers-camel` | `io.casehub.workers.camel` | Apache Camel worker — 300+ connectors |
+| `workers-testing` | `casehub-workers-testing` | `io.casehub.workers.testing` | Shared test fixtures — **test scope only, never compile/runtime** |
 
-## Key SPIs (from casehub-engine-api)
+Sub-packages follow function: `.registry`, `.callback`, `.fault`, `.route`, `.component` as needed within each root package.
 
-Workers implement these SPIs. All are defined in `casehub-engine-api` — never redefined here.
+**Build order:** `workers-common` must be first in parent POM `<modules>` — all others depend on it.
 
-| SPI | Purpose |
-|-----|---------|
-| `WorkerProvisioner` | Provision/deprovision a worker instance for a case step |
-| `CaseChannelProvider` | Open and manage channels for worker communication |
-| `WorkerStatusListener` | Receive lifecycle events from running workers |
-| `WorkerContextProvider` | Supply context to the worker at invocation time |
+## Engine Integration — Two SPIs, Two Call Sites
 
-**`postToChannel` is 6-param** (engine#343): `(channel, from, content, MessageType, correlationId, deadline)` — never use the 3-param convenience form in production implementations.
+Workers implement two engine SPIs — these are called at different times:
 
-## Worker Candidates (priority order)
+| SPI | Call site | Purpose for Camel |
+|-----|-----------|-------------------|
+| `ReactiveWorkerProvisioner` | `CaseContextChangedEventHandler.tryProvision()` | Capability probe — validates route exists, returns `ProvisionResult.empty()` |
+| `WorkerExecutionManager` | `WorkerScheduleEventHandler` | Actual dispatch — sends exchange, manages completion |
 
-Research and justification are in the workspace `HANDOFF.md` and in the parent research doc.
+Both are `@ApplicationScoped` (no `@DefaultBean`). CDI displaces `NoOpReactiveWorkerProvisioner` and `NoOpWorkerExecutionManager` when Camel beans are present.
 
-| Priority | Worker | Key Capability |
-|----------|--------|---------------|
-| 1 | `workers-http` | Any HTTP service — broadest compatibility, simplest to implement |
-| 2 | `workers-camel` | 300+ enterprise connectors via Quarkus Camel |
-| 3 | MCP worker | Any MCP server's tools become dispatchable workers |
-| 4 | `workers-script` | Shell/Python/JS script execution |
-| 5 | GitHub Actions | Trigger GH Actions workflows as case steps |
-| 6 | `workers-k8s-job` | Any containerised workload via Kubernetes Job |
-| 7 | Ansible | Ansible playbook execution — strategic fit with desired-state |
-| 8 | AWS Lambda | FaaS dispatch |
+**`NoOpWorkerExecutionManager @DefaultBean`** does not yet exist in `casehub-engine` — tracked as engine#447. Must land before a deployment without `scheduler-quartz` AND without `workers-camel` can start.
+
+## workers-common Key Types
+
+| Type | Purpose |
+|------|---------|
+| `PendingCompletion` | Registry entry per async dispatch — carries `dispatchId`, `workerType`, `callbackToken`, `capability`, `eventLogId` |
+| `WorkerCorrelationContext` | Per-dispatch context — `CaseInstance`, `Worker`, `idempotency`, `tenancyId` |
+| `AsyncWorkerCompletionRegistry` | In-memory pending completion store; `expireStale()` fires `CompletionExpiredEvent` CDI async |
+| `WorkflowCompletionPublisher` | Fires `WorkflowExecutionCompleted` on `WORKER_EXECUTION_FINISHED` via `eventBus.publish()` |
+| `WorkerCallbackResource` | `POST /workers/complete/{dispatchId}` — REST callback for external systems |
+| `FaultCallbackEvent` | CDI async event fired by `WorkerCallbackResource` on faulted REST callback |
+| `CompletionExpiredEvent` | CDI async event fired by `AsyncWorkerCompletionRegistry.expireStale()` |
+| `CasehubWorkerHeaders` | Header name constants shared across all worker types |
+
+## workers-camel Key Types
+
+| Type | Purpose |
+|------|---------|
+| `CamelWorkerConstants.WORKER_TYPE = "camel"` | workerType discriminator — passed to `register()`, used by CDI observers to filter events |
+| `CamelWorkerEventBusAddresses.CAMEL_WORKER_FAULT` | Separate fault address from Quartz's `WORKFLOW_EXECUTION_FAILED` |
+| `CamelWorkerFaultPublisher` | Fires `WorkflowExecutionFailed` on `CAMEL_WORKER_FAULT` |
+| `CamelWorkerFaultEventHandler` | `@ConsumeEvent(CAMEL_WORKER_FAULT, blocking=true)` — persists failure, counts retries, re-dispatches or exhausts |
+| `CamelCompletionExpiryObserver` | `@ObservesAsync CompletionExpiredEvent` — filters on `WORKER_TYPE`, routes to fault publisher |
+| `CamelFaultCallbackObserver` | `@ObservesAsync FaultCallbackEvent` — filters on `WORKER_TYPE`, routes to fault publisher |
 
 ## Key Rules
 
 - `workers-testing` is never a compile or runtime dependency — test scope only.
-- Each worker module must activate by classpath presence (`@ApplicationScoped`, no configuration required to enable).
-- Workers must be stateless — all state lives in the case instance or the external system, never in the worker provisioner bean.
-- `tenancyId` must be propagated through all provisioner calls — bind in Repository layer only (PP-20260520-e6a5f0).
-- Workers must implement idempotent provisioning — calling `provision()` twice must be safe.
+- Each worker module activates by classpath presence (`@ApplicationScoped`, no config required to enable).
+- Workers are stateless — all state in the case instance or external system, never in provisioner beans.
+- `tenancyId` propagated through all calls — bind in Repository layer only (PP-20260520-e6a5f0).
+- Completion fires `eventBus.publish()` on `WORKER_EXECUTION_FINISHED` — never `request()`. Two consumers exist (`WorkflowExecutionCompletedHandler` + `PlanItemCompletionHandler`); `publish()` delivers to both.
+- Camel faults fire on `CAMEL_WORKER_FAULT`, NOT `WORKFLOW_EXECUTION_FAILED` — Quartz listens on the latter and would double-process Camel faults.
+- Every CDI event observer (`CamelCompletionExpiryObserver`, `CamelFaultCallbackObserver`) MUST filter by `pending.workerType()` — required when two worker modules are co-deployed.
+- Retry uses `emitOn(Infrastructure.getDefaultWorkerPool())` after Vert.x timer — not `runSubscriptionOn`. Timer fires on event loop; `emitOn` re-dispatches to worker pool before `submit()`.
+- Retry logic mirrors `QuartzWorkerExecutionJobListener` exactly: `failureCount < retryPolicy.maxAttempts()` (strict `<`); null policy defaults to `new RetryPolicy()` (3 attempts, 10s FIXED).
+
+## Co-deployment Constraints
+
+- `workers-camel` + `scheduler-quartz` on same classpath → CDI ambiguity on `WorkerExecutionManager` → startup failure. Unsupported until a composite manager is built in engine.
+- `workers-camel` + `workers-http` → `workerType` discriminator in `PendingCompletion` prevents double CDI event handling. `WorkerExecutionManager` CDI ambiguity still applies — same composite manager needed.
+
+## Cross-Repo Dependencies
+
+| Dependency | Why |
+|---|---|
+| `casehub-engine-api` | `ReactiveWorkerProvisioner`, `WorkerExecutionManager`, `Worker`, `Capability`, `ExecutionPolicy`, `RetryPolicy`, `BackoffStrategy` |
+| `casehub-engine-common` | `WorkflowExecutionCompleted`, `WorkflowExecutionFailed`, `CaseInstance`, `EventLog`, `EventBusAddresses`, `WorkerExecutionKeys`, `EventLogRepository` |
+| engine#447 | `NoOpWorkerExecutionManager @DefaultBean` — must land before full deployment works |
+| platform#73 | `casehub-endpoints` — `EndpointRegistry` SPI for named endpoint resolution (workers designed to work without it until it ships) |
 
 ## Cross-Repo Conventions
 
 Protocols live in `casehub/garden`. Do not write protocol files in this repo.
-
-## Endpoint Registry Context
-
-A `casehub-endpoints` module is planned for `casehub-platform`. Workers will reference named endpoints rather than hardcoded connection details. An `EndpointRegistry` SPI (Path-based addressing, tenant-scoped) will allow workers to resolve connection info by name. Issue filed: `casehubio/platform` (see workspace HANDOFF.md for issue number).
 
 ## Artifact Locations
 
