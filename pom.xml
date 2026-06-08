@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
@@ -10,16 +10,53 @@
         <version>0.2-SNAPSHOT</version>
     </parent>
 
-    <groupId>io.casehub</groupId>
     <artifactId>casehub-workers-parent</artifactId>
-    <version>0.1-SNAPSHOT</version>
+    <version>0.2-SNAPSHOT</version>
     <packaging>pom</packaging>
 
-    <name>CaseHub Workers Parent</name>
+    <name>CaseHub Workers :: Parent</name>
     <description>Collection of CaseHub worker implementations — HTTP, Camel, Script, K8s Job and more</description>
+    <url>https://github.com/casehubio/casehub-workers</url>
+
+    <modules>
+        <module>workers-common</module>
+        <module>workers-http</module>
+        <module>workers-camel</module>
+        <module>workers-testing</module>
+    </modules>
+
+    <properties>
+        <java.version>21</java.version>
+        <maven.compiler.release>${java.version}</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <version.quarkus.platform>3.32.2</version.quarkus.platform>
+        <version.io.casehub>0.2-SNAPSHOT</version.io.casehub>
+        <jandex-maven-plugin.version>3.3.1</jandex-maven-plugin.version>
+    </properties>
 
     <dependencyManagement>
         <dependencies>
+            <dependency>
+                <groupId>io.quarkus.platform</groupId>
+                <artifactId>quarkus-bom</artifactId>
+                <version>${version.quarkus.platform}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkus.platform</groupId>
+                <artifactId>quarkus-camel-bom</artifactId>
+                <version>${version.quarkus.platform}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- casehub-workers inter-module -->
+            <dependency>
+                <groupId>io.casehub</groupId>
+                <artifactId>casehub-workers-common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
             <dependency>
                 <groupId>io.casehub</groupId>
                 <artifactId>casehub-workers-http</artifactId>
@@ -35,13 +72,104 @@
                 <artifactId>casehub-workers-testing</artifactId>
                 <version>${project.version}</version>
             </dependency>
+
+            <!-- Engine — ReactiveWorkerProvisioner, WorkerExecutionManager SPIs -->
+            <dependency>
+                <groupId>io.casehub</groupId>
+                <artifactId>casehub-engine-api</artifactId>
+                <version>${version.io.casehub}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.casehub</groupId>
+                <artifactId>casehub-engine-common</artifactId>
+                <version>${version.io.casehub}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.casehub</groupId>
+                <artifactId>casehub-engine-testing</artifactId>
+                <version>${version.io.casehub}</version>
+                <scope>test</scope>
+            </dependency>
+
+            <!-- Platform — CurrentPrincipal, tenancyId -->
+            <dependency>
+                <groupId>io.casehub</groupId>
+                <artifactId>casehub-platform-api</artifactId>
+                <version>${version.io.casehub}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.casehub</groupId>
+                <artifactId>casehub-platform</artifactId>
+                <version>${version.io.casehub}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.casehub</groupId>
+                <artifactId>casehub-platform-testing</artifactId>
+                <version>${version.io.casehub}</version>
+                <scope>test</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>org.assertj</groupId>
+                <artifactId>assertj-core</artifactId>
+                <version>3.27.7</version>
+                <scope>test</scope>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
-    <modules>
-        <module>workers-http</module>
-        <module>workers-camel</module>
-        <module>workers-testing</module>
-    </modules>
+    <repositories>
+        <repository>
+            <id>github</id>
+            <name>casehubio GitHub Packages</name>
+            <url>https://maven.pkg.github.com/casehubio/*</url>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+        </repository>
+    </repositories>
+
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <name>casehubio GitHub Packages</name>
+            <url>https://maven.pkg.github.com/casehubio/casehub-workers</url>
+        </repository>
+        <snapshotRepository>
+            <id>github</id>
+            <name>casehubio GitHub Packages</name>
+            <url>https://maven.pkg.github.com/casehubio/casehub-workers</url>
+            <uniqueVersion>false</uniqueVersion>
+        </snapshotRepository>
+    </distributionManagement>
+
+    <scm>
+        <connection>scm:git:https://github.com/casehubio/casehub-workers.git</connection>
+        <developerConnection>scm:git:https://github.com/casehubio/casehub-workers.git</developerConnection>
+        <url>https://github.com/casehubio/casehub-workers</url>
+    </scm>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.13.0</version>
+                    <configuration>
+                        <parameters>true</parameters>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.2.5</version>
+                    <configuration>
+                        <rerunFailingTestsCount>2</rerunFailingTestsCount>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
 
 </project>

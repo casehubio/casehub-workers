@@ -1,23 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
         <groupId>io.casehub</groupId>
         <artifactId>casehub-workers-parent</artifactId>
-        <version>0.1-SNAPSHOT</version>
+        <version>0.2-SNAPSHOT</version>
     </parent>
 
     <artifactId>casehub-workers-testing</artifactId>
-    <name>CaseHub Workers — Testing</name>
-    <description>Test fixtures for casehub-workers — NoOpWorkerProvisioner, CaptureWorkerProvisioner, test route builders. Never a compile or runtime dependency — test scope only.</description>
+
+    <name>CaseHub Workers :: Testing</name>
+    <description>Test fixtures for casehub-workers — mock registries, capture publishers, test routes.
+        Never a compile or runtime dependency — test scope only.</description>
 
     <dependencies>
         <dependency>
             <groupId>io.casehub</groupId>
             <artifactId>casehub-engine-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.casehub</groupId>
+            <artifactId>casehub-engine-common</artifactId>
         </dependency>
         <dependency>
             <groupId>io.casehub</groupId>
@@ -29,7 +35,7 @@
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
-            <artifactId>quarkus-junit5</artifactId>
+            <artifactId>quarkus-junit</artifactId>
         </dependency>
     </dependencies>
 </project>
