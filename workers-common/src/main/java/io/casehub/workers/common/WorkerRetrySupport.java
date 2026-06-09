@@ -1,6 +1,5 @@
 package io.casehub.workers.common;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.casehub.api.model.BackoffStrategy;
@@ -36,9 +35,6 @@ import java.util.concurrent.ThreadLocalRandom;
 public class WorkerRetrySupport {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-
-    /** TypeReference for deserializing payload to Map — needed by fault handlers in reloadAndResubmit. */
-    static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
 
     @Inject EventLogRepository eventLogRepository;
     @Inject EventBus eventBus;

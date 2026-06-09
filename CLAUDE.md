@@ -48,8 +48,6 @@ Workers implement two engine SPIs — these are called at different times:
 
 Both are `@ApplicationScoped` (no `@DefaultBean`). CDI displaces `NoOpReactiveWorkerProvisioner` and `NoOpWorkerExecutionManager` when Camel beans are present.
 
-**`NoOpWorkerExecutionManager @DefaultBean`** does not yet exist in `casehub-engine` — tracked as engine#447. Must land before a deployment without `scheduler-quartz` AND without `workers-camel` can start.
-
 ## workers-common Key Types
 
 | Type | Purpose |
@@ -59,6 +57,7 @@ Both are `@ApplicationScoped` (no `@DefaultBean`). CDI displaces `NoOpReactiveWo
 | `AsyncWorkerCompletionRegistry` | In-memory pending completion store; `expireStale()` fires `CompletionExpiredEvent` CDI async |
 | `WorkflowCompletionPublisher` | Fires `WorkflowExecutionCompleted` on `WORKER_EXECUTION_FINISHED` via `eventBus.publish()` |
 | `WorkerCallbackResource` | `POST /workers/complete/{dispatchId}` — REST callback for external systems |
+| `WorkerRetrySupport` | Shared retry building blocks — `persistFailureLog`, `countFailedAttempts`, `publishRetriesExhausted`, `resolveRetryPolicy`, `computeBackoffDelayMs` |
 | `FaultCallbackEvent` | CDI async event fired by `WorkerCallbackResource` on faulted REST callback |
 | `CompletionExpiredEvent` | CDI async event fired by `AsyncWorkerCompletionRegistry.expireStale()` |
 | `CasehubWorkerHeaders` | Header name constants shared across all worker types |
@@ -74,6 +73,21 @@ Both are `@ApplicationScoped` (no `@DefaultBean`). CDI displaces `NoOpReactiveWo
 | `CamelCompletionExpiryObserver` | `@ObservesAsync CompletionExpiredEvent` — filters on `WORKER_TYPE`, routes to fault publisher |
 | `CamelFaultCallbackObserver` | `@ObservesAsync FaultCallbackEvent` — filters on `WORKER_TYPE`, routes to fault publisher |
 
+## workers-http Key Types
+
+| Type | Purpose |
+|------|---------|
+| `HttpWorkerConstants.WORKER_TYPE = "http"` | workerType discriminator |
+| `HttpWorkerEventBusAddresses.HTTP_WORKER_FAULT` | Separate fault address from Camel and Quartz |
+| `HttpWorkerRoute` | SPI interface for Tier 1 endpoint registration |
+| `HttpEndpointResolver` | 3-tier capability tag → `ResolvedEndpoint` resolution (SPI bean > config > EndpointRegistry) |
+| `HttpWorkerExecutionManager` | Sync/async dispatch via Vert.x WebClient — reactive-native, no `emitOn` needed |
+| `HttpWorkerFaultPublisher` | Fires `WorkflowExecutionFailed` on `HTTP_WORKER_FAULT` |
+| `HttpWorkerFaultEventHandler` | `@ConsumeEvent(HTTP_WORKER_FAULT, blocking=true)` — uses `WorkerRetrySupport`, adds `PermanentFaultException` (4xx) and `RetryAfterException` (429) |
+| `PermanentFaultException` | 4xx faults — bypasses retry immediately |
+| `RetryAfterException` | 429 faults — carries `retryAfterMs` from `Retry-After` header |
+| `ExchangeMode` | `SYNC` (default) or `ASYNC` |
+
 ## Key Rules
 
 - `workers-testing` is never a compile or runtime dependency — test scope only.
@@ -81,10 +95,13 @@ Both are `@ApplicationScoped` (no `@DefaultBean`). CDI displaces `NoOpReactiveWo
 - Workers are stateless — all state in the case instance or external system, never in provisioner beans.
 - `tenancyId` propagated through all calls — bind in Repository layer only (PP-20260520-e6a5f0).
 - Completion fires `eventBus.publish()` on `WORKER_EXECUTION_FINISHED` — never `request()`. Two consumers exist (`WorkflowExecutionCompletedHandler` + `PlanItemCompletionHandler`); `publish()` delivers to both.
-- Camel faults fire on `CAMEL_WORKER_FAULT`, NOT `WORKFLOW_EXECUTION_FAILED` — Quartz listens on the latter and would double-process Camel faults.
-- Every CDI event observer (`CamelCompletionExpiryObserver`, `CamelFaultCallbackObserver`) MUST filter by `pending.workerType()` — required when two worker modules are co-deployed.
-- Retry uses `emitOn(Infrastructure.getDefaultWorkerPool())` after Vert.x timer — not `runSubscriptionOn`. Timer fires on event loop; `emitOn` re-dispatches to worker pool before `submit()`.
-- Retry logic mirrors `QuartzWorkerExecutionJobListener` exactly: `failureCount < retryPolicy.maxAttempts()` (strict `<`); null policy defaults to `new RetryPolicy()` (3 attempts, 10s FIXED).
+- Worker faults fire on worker-specific addresses (`CAMEL_WORKER_FAULT`, `HTTP_WORKER_FAULT`), NOT `WORKFLOW_EXECUTION_FAILED` — Quartz listens on the latter and would double-process.
+- Every CDI event observer MUST filter by `pending.workerType()` — required when two worker modules are co-deployed.
+- Camel retry uses `emitOn(Infrastructure.getDefaultWorkerPool())` after Vert.x timer — `ProducerTemplate` is blocking.
+- HTTP retry does NOT use `emitOn` — `WebClient` is event-loop native, no thread hop needed.
+- Retry logic via `WorkerRetrySupport`: `failureCount < retryPolicy.maxAttempts()` (strict `<`); null policy defaults to `new RetryPolicy()` (3 attempts, 10s FIXED).
+- HTTP 4xx (except 429) throws `PermanentFaultException` — skips retry immediately.
+- HTTP 429 with `Retry-After` header throws `RetryAfterException` — overrides configured backoff delay.
 
 ## Co-deployment Constraints
 
@@ -97,8 +114,8 @@ Both are `@ApplicationScoped` (no `@DefaultBean`). CDI displaces `NoOpReactiveWo
 |---|---|
 | `casehub-engine-api` | `ReactiveWorkerProvisioner`, `WorkerExecutionManager`, `Worker`, `Capability`, `ExecutionPolicy`, `RetryPolicy`, `BackoffStrategy` |
 | `casehub-engine-common` | `WorkflowExecutionCompleted`, `WorkflowExecutionFailed`, `CaseInstance`, `EventLog`, `EventBusAddresses`, `WorkerExecutionKeys`, `EventLogRepository` |
-| engine#447 | `NoOpWorkerExecutionManager @DefaultBean` — must land before full deployment works |
 | platform#73 | `casehub-endpoints` — `EndpointRegistry` SPI for named endpoint resolution (workers designed to work without it until it ships) |
+| engine#461 | Composite `WorkerExecutionManager` — required for co-deploying HTTP + Camel + Quartz on same classpath |
 
 ## Cross-Repo Conventions
 
