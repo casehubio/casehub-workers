@@ -18,6 +18,10 @@ import io.vertx.mutiny.core.eventbus.EventBus;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.time.Instant;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
@@ -35,6 +39,8 @@ import java.util.concurrent.ThreadLocalRandom;
 public class WorkerRetrySupport {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final DateTimeFormatter HTTP_DATE =
+        DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US);
 
     @Inject EventLogRepository eventLogRepository;
     @Inject EventBus eventBus;
@@ -77,6 +83,38 @@ public class WorkerRetrySupport {
                 yield cap == 0 ? 0 : ThreadLocalRandom.current().nextLong(cap + 1);
             }
         };
+    }
+
+    /**
+     * Parses a Retry-After header value (integer seconds or HTTP-date) and returns
+     * {@link RetryAfterException} when parseable, or a generic {@link RuntimeException}
+     * otherwise.
+     *
+     * <ul>
+     *   <li>Integer seconds → {@code RetryAfterException} with {@code retryAfterMs = seconds * 1000}</li>
+     *   <li>HTTP-date → {@code RetryAfterException} with {@code retryAfterMs = max(0, delta)}</li>
+     *   <li>Null, blank, or unparseable → generic {@code RuntimeException}</li>
+     * </ul>
+     */
+    public static RuntimeException parseRetryAfter(String retryAfter, int status, String statusMessage) {
+        String message = status + " " + statusMessage;
+        if (retryAfter == null || retryAfter.isBlank()) {
+            return new RuntimeException(message);
+        }
+        try {
+            long seconds = Long.parseLong(retryAfter.trim());
+            return new RetryAfterException(seconds * 1000, message);
+        } catch (NumberFormatException ignored) {
+            // not an integer
+        }
+        try {
+            ZonedDateTime retryDate = ZonedDateTime.parse(retryAfter.trim(), HTTP_DATE);
+            long deltaMs = retryDate.toInstant().toEpochMilli() - System.currentTimeMillis();
+            return new RetryAfterException(Math.max(0, deltaMs), message);
+        } catch (DateTimeParseException ignored) {
+            // unparseable
+        }
+        return new RuntimeException(message);
     }
 
     /**

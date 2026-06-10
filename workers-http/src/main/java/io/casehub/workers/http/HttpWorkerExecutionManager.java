@@ -11,8 +11,11 @@ import io.casehub.engine.common.spi.scheduler.WorkerExecutionManager;
 import io.casehub.workers.common.AsyncWorkerCompletionRegistry;
 import io.casehub.workers.common.CasehubWorkerHeaders;
 import io.casehub.workers.common.PendingCompletion;
+import io.casehub.workers.common.PermanentFaultException;
+import io.casehub.workers.common.RetryAfterException;
 import io.casehub.workers.common.WorkerCorrelationContext;
 import io.casehub.workers.common.WorkerProvisioningException;
+import io.casehub.workers.common.WorkerRetrySupport;
 import io.casehub.workers.common.WorkflowCompletionPublisher;
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.http.HttpMethod;
@@ -26,10 +29,6 @@ import jakarta.inject.Inject;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
-import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -41,8 +40,6 @@ public class HttpWorkerExecutionManager implements WorkerExecutionManager {
 
     private static final Logger LOG = Logger.getLogger(HttpWorkerExecutionManager.class);
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
-    private static final DateTimeFormatter HTTP_DATE =
-        DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US);
     private static final Pattern URI_TEMPLATE_PATTERN = Pattern.compile("\\{(\\w+)\\}");
 
     @Inject HttpEndpointResolver httpEndpointResolver;
@@ -151,7 +148,7 @@ public class HttpWorkerExecutionManager implements WorkerExecutionManager {
                 }
                 if (status == 429) {
                     String retryAfter = response.getHeader("Retry-After");
-                    RuntimeException ex = parseRetryAfter(retryAfter, status, response.statusMessage());
+                    RuntimeException ex = WorkerRetrySupport.parseRetryAfter(retryAfter, status, response.statusMessage());
                     if (ex instanceof RetryAfterException ra) {
                         long remainingMs = java.time.Duration.between(
                             java.time.Instant.now(), pending.expiresAt()).toMillis();
@@ -180,7 +177,7 @@ public class HttpWorkerExecutionManager implements WorkerExecutionManager {
         }
         if (status == 429) {
             String retryAfter = response.getHeader("Retry-After");
-            throw parseRetryAfter(retryAfter, status, response.statusMessage());
+            throw WorkerRetrySupport.parseRetryAfter(retryAfter, status, response.statusMessage());
         }
         if (status >= 400 && status < 500) {
             throw new PermanentFaultException(status, status + " " + response.statusMessage());
@@ -221,29 +218,6 @@ public class HttpWorkerExecutionManager implements WorkerExecutionManager {
         }
         matcher.appendTail(sb);
         return sb.toString();
-    }
-
-    RuntimeException parseRetryAfter(String retryAfter, int status, String statusMessage) {
-        String message = status + " " + statusMessage;
-        if (retryAfter == null || retryAfter.isBlank()) {
-            return new RuntimeException(message);
-        }
-        // Try integer seconds first
-        try {
-            long seconds = Long.parseLong(retryAfter.trim());
-            return new RetryAfterException(seconds * 1000, message);
-        } catch (NumberFormatException ignored) {
-            // not an integer
-        }
-        // Try HTTP-date
-        try {
-            ZonedDateTime retryDate = ZonedDateTime.parse(retryAfter.trim(), HTTP_DATE);
-            long deltaMs = retryDate.toInstant().toEpochMilli() - System.currentTimeMillis();
-            return new RetryAfterException(Math.max(0, deltaMs), message);
-        } catch (DateTimeParseException ignored) {
-            // unparseable
-        }
-        return new RuntimeException(message);
     }
 
     @Override

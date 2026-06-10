@@ -1,4 +1,4 @@
-package io.casehub.workers.http;
+package io.casehub.workers.common;
 
 public class RetryAfterException extends RuntimeException {
     private final long retryAfterMs;

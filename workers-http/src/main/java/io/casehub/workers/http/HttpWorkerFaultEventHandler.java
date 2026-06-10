@@ -8,6 +8,8 @@ import io.casehub.engine.common.internal.event.WorkflowExecutionFailed;
 import io.casehub.engine.common.internal.model.CaseInstance;
 import io.casehub.engine.common.spi.EventLogRepository;
 import io.casehub.engine.common.spi.scheduler.WorkerExecutionManager;
+import io.casehub.workers.common.PermanentFaultException;
+import io.casehub.workers.common.RetryAfterException;
 import io.casehub.workers.common.WorkerRetrySupport;
 import io.quarkus.vertx.ConsumeEvent;
 import io.smallrye.mutiny.Uni;

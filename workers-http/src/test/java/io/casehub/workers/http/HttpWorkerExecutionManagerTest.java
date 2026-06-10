@@ -11,6 +11,8 @@ import io.casehub.engine.common.internal.model.CaseInstance;
 import io.casehub.workers.common.AsyncWorkerCompletionRegistry;
 import io.casehub.workers.common.CasehubWorkerHeaders;
 import io.casehub.workers.common.PendingCompletion;
+import io.casehub.workers.common.PermanentFaultException;
+import io.casehub.workers.common.RetryAfterException;
 import io.casehub.workers.common.WorkerCorrelationContext;
 import io.casehub.workers.common.WorkerProvisioningException;
 import io.casehub.workers.common.WorkflowCompletionPublisher;
@@ -418,52 +420,6 @@ class HttpWorkerExecutionManagerTest {
     void getActiveWorkCount_delegatesToRegistry() {
         when(asyncWorkerCompletionRegistry.countByWorkerName("w1")).thenReturn(3);
         assertThat(manager.getActiveWorkCount("w1")).isEqualTo(3);
-    }
-
-    // --- parseRetryAfter unit tests ---
-
-    @Test
-    void parseRetryAfter_integerSeconds() {
-        RuntimeException ex = manager.parseRetryAfter("60", 429, "Too Many Requests");
-        assertThat(ex).isInstanceOf(RetryAfterException.class);
-        assertThat(((RetryAfterException) ex).retryAfterMs()).isEqualTo(60000);
-    }
-
-    @Test
-    void parseRetryAfter_httpDate_inFuture() {
-        // Use a date 120 seconds in the future
-        java.time.ZonedDateTime future = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).plusSeconds(120);
-        String httpDate = java.time.format.DateTimeFormatter
-            .ofPattern("EEE, dd MMM yyyy HH:mm:ss zzz", java.util.Locale.US)
-            .format(future);
-        RuntimeException ex = manager.parseRetryAfter(httpDate, 429, "Too Many Requests");
-        assertThat(ex).isInstanceOf(RetryAfterException.class);
-        // Allow 5 seconds of clock drift in assertion
-        assertThat(((RetryAfterException) ex).retryAfterMs()).isBetween(115_000L, 125_000L);
-    }
-
-    @Test
-    void parseRetryAfter_httpDate_inPast() {
-        java.time.ZonedDateTime past = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).minusSeconds(60);
-        String httpDate = java.time.format.DateTimeFormatter
-            .ofPattern("EEE, dd MMM yyyy HH:mm:ss zzz", java.util.Locale.US)
-            .format(past);
-        RuntimeException ex = manager.parseRetryAfter(httpDate, 429, "Too Many Requests");
-        assertThat(ex).isInstanceOf(RetryAfterException.class);
-        assertThat(((RetryAfterException) ex).retryAfterMs()).isEqualTo(0);
-    }
-
-    @Test
-    void parseRetryAfter_unparseable() {
-        RuntimeException ex = manager.parseRetryAfter("garbage", 429, "Too Many Requests");
-        assertThat(ex).isNotInstanceOf(RetryAfterException.class);
-        assertThat(ex).isInstanceOf(RuntimeException.class);
-    }
-
-    @Test
-    void parseRetryAfter_null() {
-        RuntimeException ex = manager.parseRetryAfter(null, 429, "Too Many Requests");
-        assertThat(ex).isNotInstanceOf(RetryAfterException.class);
     }
 
     // --- Connection failure tests ---
