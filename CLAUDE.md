@@ -32,6 +32,7 @@ mvn --batch-mode deploy -DskipTests
 | `workers-http` | `casehub-workers-http` | `io.casehub.workers.http` | HTTP/webhook worker — 3-tier endpoint resolution, sync/async dispatch |
 | `workers-camel` | `casehub-workers-camel` | `io.casehub.workers.camel` | Apache Camel worker — 300+ connectors |
 | `workers-github-actions` | `casehub-workers-github-actions` | `io.casehub.workers.githubactions` | GitHub Actions worker — workflow_dispatch + repository_dispatch |
+| `workers-mcp` | `casehub-workers-mcp` | `io.casehub.workers.mcp` | MCP worker — dispatch case steps to MCP server tools via Streamable HTTP |
 | `workers-testing` | `casehub-workers-testing` | `io.casehub.workers.testing` | Shared test fixtures — **test scope only, never compile/runtime** |
 
 Sub-packages follow function: `.registry`, `.callback`, `.fault`, `.route`, `.component` as needed within each root package.
@@ -101,6 +102,20 @@ Both are `@ApplicationScoped` (no `@DefaultBean`). CDI displaces `NoOpReactiveWo
 | `GitHubActionsWorkerFaultEventHandler` | `@ConsumeEvent(GITHUB_ACTIONS_WORKER_FAULT, blocking=true)` — 422 on workflow-dispatch retryable (60s), 422 on repository-dispatch permanent |
 | `GitHubActionsReactiveWorkerProvisioner` | Capability probe — validates tags and token availability |
 
+## workers-mcp Key Types
+
+| Type | Purpose |
+|------|---------|
+| `McpWorkerConstants.WORKER_TYPE = "mcp"` | workerType discriminator |
+| `McpWorkerEventBusAddresses.MCP_WORKER_FAULT` | Separate fault address from HTTP, Camel, and GitHub Actions |
+| `McpServerResolver` | Config-based server registry — N:1 capability tag mapping (`mcp:<server>:<tool>` → `ResolvedMcpServer`) |
+| `McpSessionManager` | `@ApplicationScoped` — MCP session lifecycle: lazy init with concurrent dedup via memoized Uni, session caching, `@PreDestroy` cleanup |
+| `McpSession` | Per-server runtime state — `sessionId`, `protocolVersion`, `AtomicLong requestIdCounter` |
+| `McpWorkerExecutionManager` | Dispatches `tools/call` via Vert.x WebClient — dual response parsing (JSON + SSE), `structuredContent` preferred |
+| `McpWorkerFaultPublisher` | Fires `WorkflowExecutionFailed` on `MCP_WORKER_FAULT` |
+| `McpWorkerFaultEventHandler` | `@ConsumeEvent(MCP_WORKER_FAULT, blocking=true)` — `isError: true` retryable, malformed retryable, 404-with-session retryable (re-initializes) |
+| `McpReactiveWorkerProvisioner` | Capability probe — validates tag in resolved set, server URL non-blank |
+
 ## Key Rules
 
 - `workers-testing` is never a compile or runtime dependency — test scope only.
@@ -118,12 +133,20 @@ Both are `@ApplicationScoped` (no `@DefaultBean`). CDI displaces `NoOpReactiveWo
 - GitHub Actions retry does NOT use `emitOn` — `WebClient` is event-loop native (same as HTTP).
 - GitHub Actions 422 on `workflow-dispatch` throws `RetryAfterException(60_000)` — workflow_dispatch trigger caching (GE-20260426-805acb). 422 on `repository-dispatch` throws `PermanentFaultException` — malformed request.
 - GitHub Actions `ref` is required for `workflow-dispatch` — GitHub API rejects requests without it.
+- MCP retry does NOT use `emitOn` — `WebClient` is event-loop native (same as HTTP and GitHub Actions).
+- MCP `isError: true` is retryable (not permanent) — MCP spec's own example is "API rate limit exceeded."
+- MCP malformed responses are retryable — load balancer HTML pages, proxy timeouts are transient.
+- MCP 404 with active `Mcp-Session-Id` → session expired, retryable (re-initializes). 404 without session → `PermanentFaultException` (endpoint not found).
+- MCP session initialization uses `ConcurrentHashMap.computeIfAbsent` + `Uni.memoize().indefinitely()` — `onFailure().invoke(remove)` BEFORE `memoize()` (GE-20260609-78dc3a).
+- MCP protocol version: `2025-06-18` only. No backwards compatibility with `2024-11-05` HTTP+SSE transport.
+- MCP required headers: `Accept: application/json, text/event-stream`, `MCP-Protocol-Version`, `Mcp-Session-Id` (when assigned).
 
 ## Co-deployment Constraints
 
 - `workers-camel` + `scheduler-quartz` on same classpath → CDI ambiguity on `WorkerExecutionManager` → startup failure. Unsupported until a composite manager is built in engine.
 - `workers-camel` + `workers-http` → `workerType` discriminator in `PendingCompletion` prevents double CDI event handling. `WorkerExecutionManager` CDI ambiguity still applies — same composite manager needed.
 - `workers-github-actions` + any other worker → same `WorkerExecutionManager` CDI ambiguity. `workerType` discriminator prevents event cross-talk.
+- `workers-mcp` + any other worker → same `WorkerExecutionManager` CDI ambiguity. `workerType = "mcp"` discriminator prevents event cross-talk.
 
 ## Cross-Repo Dependencies
 
